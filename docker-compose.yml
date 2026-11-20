@@ -1,0 +1,13 @@
+services:
+  truthlens:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - SQLITE_DB_PATH=/app/backend/data/truthlens.db
+    volumes:
+      - ./backend/data:/app/backend/data
+    restart: unless-stopped

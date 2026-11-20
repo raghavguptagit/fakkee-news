@@ -1,0 +1,6 @@
+{
+  "name": "TruthLens AI",
+  "description": "AI-powered news credibility, misinformation, claim, and bias analysis platform combining a trained NLP classifier, linguistic signals, and Gemini contextual analysis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
