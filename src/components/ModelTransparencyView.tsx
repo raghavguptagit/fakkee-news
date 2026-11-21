@@ -50,7 +50,7 @@ export function ModelTransparencyView({ onBack }: { onBack?: () => void }) {
         )}
         <h1 className="font-display text-3xl font-semibold tracking-tight">Model & Dataset Transparency</h1>
         <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
-          Actual computed evaluation metrics from <code className="font-mono">ml/artifacts/model_v1.json</code>.
+          Evaluation metrics computed on the synthetic English writing-style benchmark (<code className="font-mono">ml/artifacts/model_v1.json</code>). High benchmark scores reflect style separation in the benchmark corpus—real-world factual verification requires live sources and critical review.
         </p>
       </div>
 

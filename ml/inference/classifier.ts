@@ -77,6 +77,24 @@ export function predictArticle(text: string): MlPredictionResult {
     };
   }
 
+  const devanagariChars = (text.match(/[\u0900-\u097F]/g) || []).length;
+  const latinChars = (text.match(/[a-zA-Z]/g) || []).length;
+  if (devanagariChars > latinChars) {
+    return {
+      available: false,
+      model_name: artifact.model_name,
+      version: artifact.version,
+      predicted_class: null,
+      score: null,
+      score_type: 'uncalibrated_model_score',
+      confidence_label: 'unavailable',
+      explanation: [],
+      limitations_note:
+        'The local TF-IDF classifier is trained on English articles only. Hindi and non-English news is analyzed using multilingual AI and linguistic cues instead.',
+      metrics_reference: '/models',
+    };
+  }
+
   const tokens = tokenize(text);
   const tf = new Map<number, number>();
   const idxToTerm = new Map<number, string>();
@@ -87,6 +105,21 @@ export function predictArticle(text: string): MlPredictionResult {
       tf.set(idx, (tf.get(idx) || 0) + 1);
       idxToTerm.set(idx, tok);
     }
+  }
+
+  if (tf.size === 0) {
+    return {
+      available: false,
+      model_name: artifact.model_name,
+      version: artifact.version,
+      predicted_class: null,
+      score: null,
+      score_type: 'uncalibrated_model_score',
+      confidence_label: 'unavailable',
+      explanation: [],
+      limitations_note: 'Not enough recognizable English vocabulary for local pattern scoring.',
+      metrics_reference: '/models',
+    };
   }
 
   let normSq = 0;

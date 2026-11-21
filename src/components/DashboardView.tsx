@@ -29,11 +29,11 @@ interface DashboardViewProps {
 }
 
 const LABEL_SHORT: Record<string, string> = {
-  LIKELY_CREDIBLE: 'Likely credible',
-  POTENTIALLY_MISLEADING: 'Potentially misleading',
-  NEEDS_VERIFICATION: 'Needs verification',
-  INSUFFICIENT_EVIDENCE: 'Insufficient evidence',
-  ANALYSIS_UNAVAILABLE: 'Unavailable',
+  LIKELY_CREDIBLE: 'Likely True',
+  POTENTIALLY_MISLEADING: 'Likely Fake',
+  NEEDS_VERIFICATION: 'Unverified',
+  INSUFFICIENT_EVIDENCE: 'Unverified (Short)',
+  ANALYSIS_UNAVAILABLE: 'Unverified',
 };
 
 export function DashboardView({ onNewAnalysis, onOpenReport }: DashboardViewProps) {

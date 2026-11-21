@@ -88,6 +88,11 @@ function stripHtmlToReadableText(html: string): { title: string | null; text: st
   const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   const title = titleMatch ? titleMatch[1].replace(/\s+/g, ' ').trim() : null;
 
+  const metaDescMatch =
+    html.match(/<meta[^>]+(?:name|property)=["'](?:description|og:description)["'][^>]+content=["']([\s\S]*?)["'][^>]*>/i) ||
+    html.match(/<meta[^>]+content=["']([\s\S]*?)["'][^>]+(?:name|property)=["'](?:description|og:description)["'][^>]*>/i);
+  const metaDesc = metaDescMatch ? metaDescMatch[1].replace(/\s+/g, ' ').trim() : '';
+
   const cleaned = html
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
@@ -109,67 +114,81 @@ function stripHtmlToReadableText(html: string): { title: string | null; text: st
         .replace(/\s+/g, ' ')
         .trim()
     )
-    .filter((p) => p.length > 30);
+    .filter((p) => p.length > 25);
 
-  const text = paragraphs.join('\n\n').slice(0, 30000);
+  const combined = paragraphs.length > 0 ? paragraphs.join('\n\n') : metaDesc;
+  const text = combined.slice(0, 30000);
   return { title, text };
 }
 
 export async function extractArticleFromUrl(rawUrl: string): Promise<ExtractedArticle> {
-  const parsed = await validateSafeUrl(rawUrl);
+  let currentUrl = (await validateSafeUrl(rawUrl)).toString();
+  const maxRedirects = 3;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
 
   try {
-    const res = await fetch(parsed.toString(), {
-      method: 'GET',
-      redirect: 'manual',
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'TruthLensAI-AcademicAnalyzer/1.0',
-        Accept: 'text/html, text/plain;q=0.9',
-      },
-    });
+    let res: Response | null = null;
+    for (let hop = 0; hop <= maxRedirects; hop++) {
+      res = await fetch(currentUrl, {
+        method: 'GET',
+        redirect: 'manual',
+        signal: controller.signal,
+        headers: {
+          'User-Agent': 'TruthLensAI-NewsChecker/1.0',
+          Accept: 'text/html, text/plain;q=0.9',
+        },
+      });
 
-    if (res.status >= 300 && res.status < 400) {
-      const location = res.headers.get('location');
-      if (!location) throw new Error('Redirect missing location header.');
-      const nextUrl = new URL(location, parsed).toString();
-      await validateSafeUrl(nextUrl);
-      throw new Error('Cross-host redirect encountered; please paste the final canonical URL or article text.');
+      if (res.status >= 300 && res.status < 400) {
+        const location = res.headers.get('location');
+        if (!location) throw new Error('The webpage redirect is incomplete. Please paste the article text directly.');
+        const nextUrl = new URL(location, currentUrl).toString();
+        const safeNext = await validateSafeUrl(nextUrl);
+        currentUrl = safeNext.toString();
+        continue;
+      }
+      break;
     }
 
+    if (!res) {
+      throw new Error('Could not reach that webpage. Please paste the article text directly.');
+    }
+    if (res.status >= 300 && res.status < 400) {
+      throw new Error('Too many redirects from that URL. Please paste the article text directly.');
+    }
     if (!res.ok) {
-      throw new Error(`Remote server returned HTTP ${res.status}. Please paste the article text directly.`);
+      throw new Error('That website blocked automatic reading or returned an error. Please paste the article text directly.');
     }
 
     const contentType = res.headers.get('content-type') || '';
     if (!contentType.includes('text/html') && !contentType.includes('text/plain')) {
-      throw new Error(`Unsupported content type (${contentType}). Only HTML and plain text articles are supported.`);
+      throw new Error('Only webpage (HTML) and plain text links are supported.');
     }
 
     const maxBytes = 1_500_000;
     const buffer = await res.arrayBuffer();
     if (buffer.byteLength > maxBytes) {
-      throw new Error('Webpage exceeds maximum safe download size (1.5 MB). Please paste the article text.');
+      throw new Error('That webpage is too large to read automatically. Please paste the article text directly.');
     }
 
     const rawBody = new TextDecoder('utf-8').decode(buffer);
+    const parsedFinal = new URL(currentUrl);
     const { title, text } = contentType.includes('text/plain')
-      ? { title: parsed.hostname, text: rawBody.slice(0, 30000) }
+      ? { title: parsedFinal.hostname, text: rawBody.slice(0, 30000) }
       : stripHtmlToReadableText(rawBody);
 
-    if (!text || text.length < 60) {
-      throw new Error('Could not extract sufficient readable article text (site may use client-side rendering or a paywall). Please paste the text directly.');
+    if (!text || text.length < 40) {
+      throw new Error('Could not read enough article text from that link. Please paste the text directly.');
     }
 
     return {
-      url: parsed.toString(),
+      url: parsedFinal.toString(),
       title,
       text,
-      publisher: parsed.hostname.replace(/^www\./, ''),
-      limitations: ['Automated HTML extraction may omit captions, tables, or paywalled sections.'],
+      publisher: parsedFinal.hostname.replace(/^www\./, ''),
+      limitations: ['Automatic webpage reading may skip captions or subscriber-only sections.'],
     };
   } finally {
     clearTimeout(timeout);

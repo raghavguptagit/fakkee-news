@@ -13,7 +13,7 @@ import {
   Sun,
   Moon,
 } from 'lucide-react';
-import { apiFetch, getStoredToken, setStoredToken } from './services/api';
+import { apiFetch, setStoredToken } from './services/api';
 import { AnalysisReport, User } from './types/api';
 import { LandingPage } from './components/LandingPage';
 import { AuthView } from './components/AuthView';
@@ -53,11 +53,6 @@ export default function App() {
   }, [darkMode]);
 
   useEffect(() => {
-    const token = getStoredToken();
-    if (!token) {
-      setAuthChecked(true);
-      return;
-    }
     apiFetch<{ user: User }>('/api/v1/auth/me')
       .then((res) => {
         setUser(res.user);

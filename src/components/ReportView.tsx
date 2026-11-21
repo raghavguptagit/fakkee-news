@@ -13,8 +13,8 @@ import {
   ArrowLeft,
 } from 'lucide-react';
 import { AnalysisReport } from '../types/api';
-import { apiFetch, streamChatFollowup } from '../services/api';
-import { AssessmentTag } from './AssessmentTag';
+import { apiFetch, isSafeHttpUrl, streamChatFollowup } from '../services/api';
+import { SimpleResultCard } from './SimpleResultCard';
 
 interface ReportViewProps {
   report: AnalysisReport;
@@ -24,6 +24,7 @@ interface ReportViewProps {
 export function ReportView({ report, onBack }: ReportViewProps) {
   const [saved, setSaved] = useState(Boolean(report.is_saved));
   const [openClaimId, setOpenClaimId] = useState<string | null>(report.claims[0]?.id || null);
+  const [showTech, setShowTech] = useState(false);
   const [messages, setMessages] = useState<Array<{ role: 'user' | 'assistant'; text: string }>>([]);
   const [question, setQuestion] = useState('');
   const [streaming, setStreaming] = useState(false);
@@ -100,15 +101,15 @@ export function ReportView({ report, onBack }: ReportViewProps) {
   };
 
   return (
-    <div className="max-w-5xl space-y-8">
+    <div className="max-w-5xl space-y-6">
       {report.is_demo && (
         <div className="p-3 text-xs font-medium text-amber-800 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900 rounded-md">
-          DEMO DATA — Analyzed from a built-in demonstration sample article.
+          Sample news example — checked with the live verification pipeline.
         </div>
       )}
 
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4 pb-6 border-b border-slate-200 dark:border-slate-800">
+      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4 pb-5 border-b border-slate-200 dark:border-slate-800">
         <div className="space-y-2 min-w-0">
           <button
             type="button"
@@ -118,8 +119,8 @@ export function ReportView({ report, onBack }: ReportViewProps) {
             <ArrowLeft className="w-3.5 h-3.5" aria-hidden="true" />
             <span>Back</span>
           </button>
-          <h1 className="font-display text-2xl sm:text-3xl font-semibold tracking-tight">
-            {report.input.title || 'Untitled Article Analysis'}
+          <h1 className="font-display text-2xl sm:text-3xl font-semibold tracking-tight break-words">
+            {report.input.title || 'News Check Result'}
           </h1>
           <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
             <span>{report.topic || 'General'}</span>
@@ -127,11 +128,11 @@ export function ReportView({ report, onBack }: ReportViewProps) {
             <span>{report.input.word_count} words</span>
             <span aria-hidden="true">·</span>
             <span>{new Date(report.provenance.created_at).toLocaleString()}</span>
-            {report.input.url && (
+            {isSafeHttpUrl(report.input.url) && (
               <>
                 <span aria-hidden="true">·</span>
                 <a
-                  href={report.input.url}
+                  href={report.input.url!}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="inline-flex items-center gap-1 text-slate-700 dark:text-slate-300 hover:underline"
@@ -143,7 +144,7 @@ export function ReportView({ report, onBack }: ReportViewProps) {
           </div>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
           <button
             type="button"
             onClick={toggleSave}
@@ -163,106 +164,25 @@ export function ReportView({ report, onBack }: ReportViewProps) {
         </div>
       </div>
 
-      {/* Assessment & Summary */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="lg:col-span-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-6 space-y-4">
-          <div className="flex items-center justify-between gap-4">
-            <AssessmentTag label={report.assessment.label} displayLabel={report.assessment.display_label} size="lg" />
-            <span className="text-xs font-mono text-slate-500 dark:text-slate-400">
-              Pipeline v{report.provenance.analysis_pipeline_version}
-            </span>
-          </div>
-          <p className="text-sm text-slate-700 dark:text-slate-300 leading-relaxed">{report.assessment.reason}</p>
-          <div className="pt-4 border-t border-slate-100 dark:border-slate-800">
-            <h2 className="text-xs font-semibold text-slate-500 dark:text-slate-400 mb-2">Executive summary</h2>
-            <p className="text-sm text-slate-800 dark:text-slate-200 leading-relaxed">{report.summary}</p>
-          </div>
-        </div>
+      {/* Plain-Language Main Result Card */}
+      <SimpleResultCard report={report} showTechnicalToggle={false} />
 
-        {/* ML Model Panel */}
-        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-6 space-y-4">
-          <h2 className="text-sm font-semibold">ML Classifier Signal</h2>
-          {report.ml.available ? (
-            <>
-              <div className="space-y-1">
-                <p className="text-xs text-slate-500 dark:text-slate-400">Predicted class</p>
-                <p className="text-sm font-mono font-medium">
-                  {report.ml.predicted_class?.replace(/_/g, ' ')}
-                </p>
-              </div>
-              <div className="flex items-baseline justify-between">
-                <div>
-                  <p className="text-xs text-slate-500 dark:text-slate-400">Uncalibrated model score</p>
-                  <p className="text-2xl font-mono font-semibold tabular-nums mt-0.5">
-                    {report.ml.score !== null ? `${(report.ml.score * 100).toFixed(1)}%` : '—'}
-                  </p>
-                </div>
-                <div className="text-right">
-                  <p className="text-xs text-slate-500 dark:text-slate-400">Confidence</p>
-                  <p className="text-xs font-mono capitalize mt-1">{report.ml.confidence_label}</p>
-                </div>
-              </div>
-              <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed pt-2 border-t border-slate-100 dark:border-slate-800">
-                {report.ml.limitations_note}
-              </p>
-            </>
-          ) : (
-            <p className="text-xs text-slate-500 dark:text-slate-400">{report.ml.limitations_note}</p>
-          )}
-        </div>
-      </div>
-
-      {/* ML Explainability: Top Contributing Terms */}
-      {report.ml.available && report.ml.explanation.length > 0 && (
-        <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-6 space-y-4">
-          <div>
-            <h2 className="text-base font-semibold">Top contributing TF-IDF terms</h2>
-            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Lexical features that most influenced the linear model score. Feature weights reflect training corpus
-              patterns, not factual proof.
-            </p>
-          </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            {report.ml.explanation.map((feat) => (
-              <div
-                key={feat.term}
-                className="flex items-center justify-between gap-3 py-2 px-3 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md text-xs"
-              >
-                <span className="font-mono font-medium truncate">{feat.term}</span>
-                <span
-                  className={`font-mono tabular-nums shrink-0 ${
-                    feat.direction === 'toward_misleading'
-                      ? 'text-rose-700 dark:text-rose-400'
-                      : 'text-emerald-700 dark:text-emerald-400'
-                  }`}
-                >
-                  {feat.contribution > 0 ? '+' : ''}
-                  {feat.contribution.toFixed(3)} ({feat.direction === 'toward_misleading' ? 'sensational' : 'credible'})
-                </span>
-              </div>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {/* Extracted Claims Accordion */}
-      <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-6 space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-          <div>
-            <h2 className="text-base font-semibold">Extracted claims ({report.claims.length})</h2>
-            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Evidence provider status: <span className="font-mono">{report.providers.evidence_search}</span> · Gemini:{' '}
-              <span className="font-mono">{report.providers.gemini}</span>
-            </p>
-          </div>
+      {/* Claims Checked */}
+      <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 sm:p-6 space-y-4">
+        <div>
+          <h2 className="text-base font-semibold">Main claims reviewed ({report.claims.length})</h2>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+            Individual statements identified in the text and whether supporting sources were found.
+          </p>
         </div>
 
         {report.claims.length === 0 ? (
-          <p className="text-sm text-slate-500 dark:text-slate-400">No specific checkable claims were extracted.</p>
+          <p className="text-sm text-slate-500 dark:text-slate-400">No specific factual claims were identified.</p>
         ) : (
           <div className="divide-y divide-slate-200 dark:divide-slate-800">
             {report.claims.map((claim) => {
               const isOpen = openClaimId === claim.id;
+              const safeEvidence = claim.evidence.filter((ev) => isSafeHttpUrl(ev.source_url));
               return (
                 <div key={claim.id} className="py-3.5">
                   <button
@@ -271,10 +191,10 @@ export function ReportView({ report, onBack }: ReportViewProps) {
                     onClick={() => setOpenClaimId(isOpen ? null : claim.id)}
                     className="w-full flex items-start justify-between gap-4 text-left"
                   >
-                    <div className="space-y-1">
-                      <p className="text-sm font-medium text-slate-900 dark:text-slate-100">{claim.text}</p>
+                    <div className="space-y-1 min-w-0">
+                      <p className="text-sm font-medium text-slate-900 dark:text-slate-100 break-words">{claim.text}</p>
                       <p className="text-xs font-mono text-slate-500 dark:text-slate-400">
-                        {claim.type} · {claim.checkability} · status: {claim.status.replace(/_/g, ' ')}
+                        {claim.type} · {claim.status.replace(/_/g, ' ')}
                       </p>
                     </div>
                     {isOpen ? (
@@ -286,39 +206,34 @@ export function ReportView({ report, onBack }: ReportViewProps) {
                   {isOpen && (
                     <div className="mt-3 pl-1 space-y-3 text-xs text-slate-600 dark:text-slate-300">
                       <p>{claim.explanation}</p>
-                      {claim.search_query && (
-                        <p className="font-mono text-slate-500 dark:text-slate-400">
-                          Suggested verification query: "{claim.search_query}"
-                        </p>
-                      )}
-                      {claim.evidence.length > 0 ? (
+                      {safeEvidence.length > 0 ? (
                         <div className="space-y-2 pt-2">
-                          {claim.evidence.map((ev, i) => (
+                          {safeEvidence.map((ev, i) => (
                             <div
                               key={i}
                               className="p-3 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md space-y-1"
                             >
-                              <div className="flex items-center justify-between gap-2">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
                                 <a
                                   href={ev.source_url}
                                   target="_blank"
                                   rel="noopener noreferrer"
-                                  className="font-medium text-slate-900 dark:text-slate-100 hover:underline inline-flex items-center gap-1"
+                                  className="font-medium text-slate-900 dark:text-slate-100 hover:underline inline-flex items-center gap-1 break-words"
                                 >
-                                  {ev.source_title} <ExternalLink className="w-3 h-3" />
+                                  {ev.source_title} <ExternalLink className="w-3 h-3 shrink-0" />
                                 </a>
                                 <span className="font-mono text-slate-500">{ev.publisher}</span>
                               </div>
                               <p className="text-slate-600 dark:text-slate-400">{ev.snippet}</p>
                               <p className="font-mono text-[11px] text-slate-400">
-                                Retrieved {new Date(ev.retrieved_at).toLocaleString()} via {ev.provider}
+                                Checked {new Date(ev.retrieved_at).toLocaleString()}
                               </p>
                             </div>
                           ))}
                         </div>
                       ) : (
                         <p className="text-slate-500 dark:text-slate-400 italic">
-                          No external evidence retrieved for this claim. Verify independently using primary sources.
+                          No external source link was matched for this claim. Please verify with trusted news outlets.
                         </p>
                       )}
                     </div>
@@ -330,10 +245,10 @@ export function ReportView({ report, onBack }: ReportViewProps) {
         )}
       </section>
 
-      {/* Linguistic Signals & Transparency */}
+      {/* Writing Tone & Transparency Checks */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-6 space-y-4">
-          <h2 className="text-base font-semibold">Linguistic & framing signals</h2>
+        <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 sm:p-6 space-y-4">
+          <h2 className="text-base font-semibold">Writing & tone observations</h2>
           <ul className="space-y-2 text-sm text-slate-700 dark:text-slate-300">
             {report.linguistic_analysis.framing_notes.map((note, idx) => (
               <li key={idx} className="leading-relaxed">
@@ -347,7 +262,7 @@ export function ReportView({ report, onBack }: ReportViewProps) {
             ...report.linguistic_analysis.attribution_quality,
           ].length > 0 && (
             <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-2">
-              <p className="text-xs font-medium text-slate-500 dark:text-slate-400">Flagged phrases (signals only)</p>
+              <p className="text-xs font-medium text-slate-500 dark:text-slate-400">Notable phrases spotted</p>
               {[
                 ...report.linguistic_analysis.sensationalism_indicators,
                 ...report.linguistic_analysis.certainty_language,
@@ -355,7 +270,7 @@ export function ReportView({ report, onBack }: ReportViewProps) {
               ]
                 .slice(0, 6)
                 .map((ind, i) => (
-                  <div key={i} className="text-xs">
+                  <div key={i} className="text-xs break-words">
                     <span className="font-mono font-medium text-slate-900 dark:text-slate-100">"{ind.phrase}"</span>{' '}
                     <span className="text-slate-500 dark:text-slate-400">— {ind.reason}</span>
                   </div>
@@ -364,7 +279,7 @@ export function ReportView({ report, onBack }: ReportViewProps) {
           )}
         </section>
 
-        <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-6 space-y-4">
+        <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 sm:p-6 space-y-4">
           <h2 className="text-base font-semibold">Source transparency & next steps</h2>
           <div className="space-y-2.5">
             {report.transparency_checks.map((tc, i) => (
@@ -392,13 +307,76 @@ export function ReportView({ report, onBack }: ReportViewProps) {
         </section>
       </div>
 
-      {/* Streaming Gemini Follow-up Assistant */}
-      <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-6 space-y-4">
+      {/* Collapsible Technical Details (For Researchers) */}
+      <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg overflow-hidden">
+        <button
+          type="button"
+          aria-expanded={showTech}
+          onClick={() => setShowTech((s) => !s)}
+          className="w-full px-5 py-3.5 flex items-center justify-between text-left text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/50"
+        >
+          <span>Technical Details (For Researchers: ML pattern weights & pipeline provenance)</span>
+          {showTech ? <ChevronUp className="w-4 h-4 shrink-0" /> : <ChevronDown className="w-4 h-4 shrink-0" />}
+        </button>
+
+        {showTech && (
+          <div className="px-5 pb-5 pt-3 border-t border-slate-200 dark:border-slate-800 space-y-4">
+            {report.ml.available ? (
+              <>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
+                  <div>
+                    <p className="text-slate-500">Pattern label</p>
+                    <p className="font-mono font-medium mt-0.5">{report.ml.predicted_class?.replace(/_/g, ' ')}</p>
+                  </div>
+                  <div>
+                    <p className="text-slate-500">Uncalibrated pattern score</p>
+                    <p className="font-mono font-semibold tabular-nums mt-0.5">
+                      {report.ml.score !== null ? `${(report.ml.score * 100).toFixed(1)}%` : '—'}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-slate-500">Pipeline & processing time</p>
+                    <p className="font-mono mt-0.5">
+                      v{report.provenance.analysis_pipeline_version} · {report.provenance.processing_ms} ms
+                    </p>
+                  </div>
+                </div>
+                {report.ml.explanation.length > 0 && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    {report.ml.explanation.map((feat) => (
+                      <div
+                        key={feat.term}
+                        className="flex items-center justify-between gap-3 py-2 px-3 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md text-xs"
+                      >
+                        <span className="font-mono font-medium truncate">{feat.term}</span>
+                        <span
+                          className={`font-mono tabular-nums shrink-0 ${
+                            feat.direction === 'toward_misleading'
+                              ? 'text-rose-700 dark:text-rose-400'
+                              : 'text-emerald-700 dark:text-emerald-400'
+                          }`}
+                        >
+                          {feat.contribution > 0 ? '+' : ''}
+                          {feat.contribution.toFixed(3)} ({feat.direction === 'toward_misleading' ? 'sensational' : 'credible'})
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <p className="text-xs text-slate-500 dark:text-slate-400">{report.ml.limitations_note}</p>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* Follow-up Assistant */}
+      <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 sm:p-6 space-y-4">
         <div>
-          <h2 className="text-base font-semibold">Follow-up analysis assistant</h2>
+          <h2 className="text-base font-semibold">Ask a follow-up question</h2>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-            Ask questions about the claims, framing, or ML signals in this report. Responses stream from Gemini
-            server-side using only this report context.
+            Ask in English or Hindi about what to double-check or why certain warning signs were flagged.
           </p>
         </div>
 
@@ -409,32 +387,32 @@ export function ReportView({ report, onBack }: ReportViewProps) {
                 key={idx}
                 className={`p-3 rounded-md text-sm leading-relaxed ${
                   m.role === 'user'
-                    ? 'bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-slate-100 ml-8'
-                    : 'bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-200 mr-8'
+                    ? 'bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-slate-100 ml-4 sm:ml-8'
+                    : 'bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-200 mr-4 sm:mr-8'
                 }`}
               >
                 <p className="text-[11px] font-mono text-slate-500 mb-1">
                   {m.role === 'user' ? 'You' : 'TruthLens Assistant'}
                 </p>
-                <p className="whitespace-pre-wrap">{m.text || (streaming ? 'Generating...' : '')}</p>
+                <p className="whitespace-pre-wrap break-words">{m.text || (streaming ? 'Thinking...' : '')}</p>
               </div>
             ))}
           </div>
         )}
 
-        <form onSubmit={handleAsk} className="flex gap-2">
+        <form onSubmit={handleAsk} className="flex flex-col sm:flex-row gap-2">
           <input
             type="text"
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
-            placeholder="Ask e.g. 'Which claim is most important to verify first?'"
-            className="flex-1 px-3 py-2 text-sm bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-md focus:outline-none focus:ring-2 focus:ring-slate-900 dark:focus:ring-slate-300"
+            placeholder="Ask e.g. 'What should I check first before sharing this?'"
+            className="flex-1 min-w-0 px-3 py-2 text-sm bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-md focus:outline-none focus:ring-2 focus:ring-slate-900 dark:focus:ring-slate-300"
           />
           {streaming ? (
             <button
               type="button"
               onClick={() => abortRef.current?.abort()}
-              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium bg-rose-600 text-white rounded-md hover:bg-rose-700"
+              className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-medium bg-rose-600 text-white rounded-md hover:bg-rose-700 shrink-0"
             >
               <Square className="w-3.5 h-3.5" /> Stop
             </button>
@@ -442,7 +420,7 @@ export function ReportView({ report, onBack }: ReportViewProps) {
             <button
               type="submit"
               disabled={!question.trim()}
-              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-950 rounded-md hover:bg-slate-800 disabled:opacity-50"
+              className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-medium bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-950 rounded-md hover:bg-slate-800 disabled:opacity-50 shrink-0"
             >
               <Send className="w-3.5 h-3.5" /> Ask
             </button>

@@ -1,10 +1,15 @@
 import { Request, Response, NextFunction } from 'express';
+import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { getDb } from './db';
 
-const JWT_SECRET = process.env.APP_SECRET_KEY || 'truthlens-dev-secret-change-in-production';
+const EPHEMERAL_SECRET = crypto.randomBytes(32).toString('hex');
+const JWT_SECRET = process.env.APP_SECRET_KEY && process.env.APP_SECRET_KEY.trim().length >= 16
+  ? process.env.APP_SECRET_KEY
+  : EPHEMERAL_SECRET;
 const TOKEN_EXPIRY = '7d';
+export const SESSION_COOKIE_NAME = 'truthlens_session';
 
 export interface AuthUser {
   id: string;
@@ -33,15 +38,80 @@ export function signToken(user: AuthUser): string {
   );
 }
 
+export function setAuthCookie(req: Request, res: Response, token: string): void {
+  const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  res.cookie(SESSION_COOKIE_NAME, token, {
+    httpOnly: true,
+    secure: isHttps,
+    sameSite: isHttps ? 'none' : 'lax',
+    ...(isHttps ? { partitioned: true } : {}),
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    path: '/',
+  });
+}
+
+export function clearAuthCookie(req: Request, res: Response): void {
+  const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  res.clearCookie(SESSION_COOKIE_NAME, {
+    httpOnly: true,
+    secure: isHttps,
+    sameSite: isHttps ? 'none' : 'lax',
+    ...(isHttps ? { partitioned: true } : {}),
+    path: '/',
+  });
+}
+
+function parseCookieValue(cookieHeader: string | undefined, name: string): string | null {
+  if (!cookieHeader) return null;
+  const pairs = cookieHeader.split(';');
+  for (const pair of pairs) {
+    const idx = pair.indexOf('=');
+    if (idx === -1) continue;
+    const key = pair.slice(0, idx).trim();
+    if (key === name) {
+      return decodeURIComponent(pair.slice(idx + 1).trim());
+    }
+  }
+  return null;
+}
+
+function verifyCsrfForCookieMutation(req: Request): boolean {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return true;
+  if (req.headers['x-requested-with'] === 'TruthLens') return true;
+  const origin = req.headers.origin;
+  const expectedHost = (req.headers['x-forwarded-host'] || req.headers.host || '') as string;
+  if (origin && expectedHost) {
+    try {
+      return new URL(origin).host === expectedHost;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 export function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization;
-  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  const cookieToken = !bearerToken ? parseCookieValue(req.headers.cookie, SESSION_COOKIE_NAME) : null;
+  const token = bearerToken || cookieToken;
 
   if (!token) {
     res.status(401).json({
       error: {
         code: 'UNAUTHORIZED',
-        message: 'Authentication required. Please sign in to continue.',
+        message: 'Please sign in to access your saved workspace.',
+        details: {},
+      },
+    });
+    return;
+  }
+
+  if (cookieToken && !bearerToken && !verifyCsrfForCookieMutation(req)) {
+    res.status(403).json({
+      error: {
+        code: 'CSRF_CHECK_FAILED',
+        message: 'Request origin verification failed.',
         details: {},
       },
     });
@@ -59,7 +129,7 @@ export function requireAuth(req: AuthenticatedRequest, res: Response, next: Next
       res.status(401).json({
         error: {
           code: 'UNAUTHORIZED',
-          message: 'Session is invalid or account is inactive.',
+          message: 'Your session is no longer valid. Please sign in again.',
           details: {},
         },
       });
@@ -100,7 +170,7 @@ export function rateLimit(maxRequests: number, windowMs: number) {
       res.status(429).json({
         error: {
           code: 'RATE_LIMITED',
-          message: 'Too many requests. Please wait a moment and try again.',
+          message: 'Too many requests right now. Please wait a moment and try again.',
           details: { retry_after_seconds: Math.ceil(windowMs / 1000) },
         },
       });

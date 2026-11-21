@@ -188,14 +188,26 @@ function evaluatePredictions(yTrue: number[], yPred: number[], yScores: number[]
 
 export function trainAndSaveModel(outputPath?: string): TrainedModelArtifact {
   const samples: LabeledSample[] = buildBenchmarkDataset();
-  const credible = deterministicShuffle(samples.filter((s) => s.label === 'credible_reporting'), 42);
-  const misleading = deterministicShuffle(samples.filter((s) => s.label === 'misleading_or_sensational'), 42);
+  const credGroups = deterministicShuffle(
+    Array.from(new Set(samples.filter((s) => s.label === 'credible_reporting').map((s) => s.groupId))),
+    42
+  );
+  const mislGroups = deterministicShuffle(
+    Array.from(new Set(samples.filter((s) => s.label === 'misleading_or_sensational').map((s) => s.groupId))),
+    42
+  );
 
-  const splitIdx0 = Math.floor(credible.length * 0.8);
-  const splitIdx1 = Math.floor(misleading.length * 0.8);
+  const credTrainGroups = new Set(credGroups.slice(0, Math.floor(credGroups.length * 0.8)));
+  const mislTrainGroups = new Set(mislGroups.slice(0, Math.floor(mislGroups.length * 0.8)));
 
-  const trainSamples = deterministicShuffle([...credible.slice(0, splitIdx0), ...misleading.slice(0, splitIdx1)], 99);
-  const testSamples = [...credible.slice(splitIdx0), ...misleading.slice(splitIdx1)];
+  const credible = samples.filter((s) => s.label === 'credible_reporting');
+  const misleading = samples.filter((s) => s.label === 'misleading_or_sensational');
+
+  const trainSamples = deterministicShuffle(
+    samples.filter((s) => credTrainGroups.has(s.groupId) || mislTrainGroups.has(s.groupId)),
+    99
+  );
+  const testSamples = samples.filter((s) => !credTrainGroups.has(s.groupId) && !mislTrainGroups.has(s.groupId));
 
   // Fit vocabulary strictly on trainSamples (no data leakage)
   const df = new Map<string, number>();
@@ -310,7 +322,7 @@ export function trainAndSaveModel(outputPath?: string): TrainedModelArtifact {
         credible_reporting: credible.length,
         misleading_or_sensational: misleading.length,
       },
-      split_strategy: 'Stratified 80/20 train/test split with vocabulary fit strictly on training fold',
+      split_strategy: 'Group-stratified 80/20 train/test split by base article template (unseen templates held out for test; vocabulary fit strictly on train)',
       limitations: [
         'Trained on English news-style linguistic patterns; does not verify real-world factual truth.',
         'Headline-only inputs have limited lexical signal and lower reliability.',

@@ -1,21 +1,58 @@
 import 'dotenv/config';
-import express, { Request, Response } from 'express';
+import dotenv from 'dotenv';
+import fs from 'fs';
+import express, { NextFunction, Request, Response } from 'express';
 import crypto from 'crypto';
 import path from 'path';
 import multer from 'multer';
 import mammoth from 'mammoth';
 import { z } from 'zod';
 import { createServer as createViteServer } from 'vite';
+
+// Ensure user-configured .env values override blank or disabled default placeholders
+const localEnvPath = path.resolve(process.cwd(), '.env');
+if (fs.existsSync(localEnvPath)) {
+  const parsedEnv = dotenv.parse(fs.readFileSync(localEnvPath));
+  for (const [k, v] of Object.entries(parsedEnv)) {
+    if (v && (!process.env[k] || process.env[k]!.trim() === '' || k.startsWith('EVIDENCE_') || k === 'TAVILY_API_KEY')) {
+      process.env[k] = v;
+    }
+  }
+}
+
 import { getDb, DEFAULT_DB_PATH } from './server/db';
-import { hashPassword, verifyPassword, signToken, requireAuth, rateLimit, AuthenticatedRequest } from './server/auth';
+import {
+  hashPassword,
+  verifyPassword,
+  signToken,
+  setAuthCookie,
+  clearAuthCookie,
+  requireAuth,
+  rateLimit,
+  AuthenticatedRequest,
+} from './server/auth';
 import { loadModelArtifact, predictArticle } from './ml/inference/classifier';
 import { analyzeLinguisticSignals } from './server/services/linguistic';
 import { extractArticleFromUrl } from './server/services/urlExtractor';
-import { isGeminiConfigured, runGeminiArticleAnalysis, streamGeminiFollowup } from './server/services/geminiService';
-import { isEvidenceProviderConfigured, getActiveEvidenceProvider, retrieveEvidenceForQuery, EvidenceRecord } from './server/services/evidenceService';
+import {
+  isGeminiConfigured,
+  extractVerificationQueries,
+  runGeminiArticleAnalysis,
+  streamGeminiFollowup,
+} from './server/services/geminiService';
+import {
+  isEvidenceProviderConfigured,
+  getActiveEvidenceProvider,
+  retrieveEvidenceForQuery,
+  deduplicateEvidence,
+  buildVerificationQueries,
+  assessEvidenceRecords,
+  EvidenceRecord,
+} from './server/services/evidenceService';
 import { computeCautiousAssessment, extractFallbackClaims, DEMO_ARTICLES } from './server/services/assessment';
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '2mb' }));
 
 // CORS allowlist middleware
@@ -32,7 +69,7 @@ app.use((req, res, next) => {
   if (origin && allowedOrigins.has(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
   }
   if (req.method === 'OPTIONS') {
@@ -89,7 +126,7 @@ app.get('/api/v1/ready', (_req, res) => {
     db.prepare('SELECT 1').get();
     res.json({ status: 'ready', database: 'sqlite', path: 'backend/data/truthlens.db' });
   } catch {
-    sendError(res, 503, 'DB_UNAVAILABLE', 'SQLite database is not ready.');
+    sendError(res, 503, 'DB_UNAVAILABLE', 'Database service is currently unavailable.');
   }
 });
 
@@ -133,7 +170,7 @@ const LoginSchema = z.object({
 app.post('/api/v1/auth/register', rateLimit(20, 60_000), (req, res) => {
   const parsed = RegisterSchema.safeParse(req.body);
   if (!parsed.success) {
-    sendError(res, 400, 'INVALID_INPUT', 'Please provide a valid email, display name (2+ chars), and password (8+ chars).');
+    sendError(res, 400, 'INVALID_INPUT', 'Please provide a valid email, display name (2+ characters), and password (8+ characters).');
     return;
   }
 
@@ -161,6 +198,7 @@ app.post('/api/v1/auth/register', rateLimit(20, 60_000), (req, res) => {
 
   const user = { id, email, display_name: parsed.data.display_name.trim(), role: 'user' as const };
   const token = signToken(user);
+  setAuthCookie(req, res, token);
   res.status(201).json({ user, token });
 });
 
@@ -183,6 +221,7 @@ app.post('/api/v1/auth/login', rateLimit(25, 60_000), (req, res) => {
 
   const user = { id: row.id, email: row.email, display_name: row.display_name, role: row.role };
   const token = signToken(user);
+  setAuthCookie(req, res, token);
   res.json({ user, token });
 });
 
@@ -192,6 +231,7 @@ app.post('/api/v1/auth/logout', requireAuth, (req: AuthenticatedRequest, res) =>
     req.user!.id,
     new Date().toISOString()
   );
+  clearAuthCookie(req, res);
   res.json({ ok: true });
 });
 
@@ -201,11 +241,12 @@ app.get('/api/v1/auth/me', requireAuth, (req: AuthenticatedRequest, res) => {
 
 app.delete('/api/v1/auth/account', requireAuth, (req: AuthenticatedRequest, res) => {
   db.prepare('DELETE FROM users WHERE id = ?').run(req.user!.id);
+  clearAuthCookie(req, res);
   res.json({ ok: true, message: 'Account and all associated analyses permanently deleted.' });
 });
 
 // ==================== URL & FILE EXTRACTION ====================
-app.post('/api/v1/extract-url', requireAuth, rateLimit(20, 60_000), async (req: AuthenticatedRequest, res) => {
+async function handleExtractUrl(req: Request, res: Response) {
   const url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
   if (!url) {
     sendError(res, 400, 'INVALID_INPUT', 'Please enter a valid http:// or https:// URL.');
@@ -215,11 +256,11 @@ app.post('/api/v1/extract-url', requireAuth, rateLimit(20, 60_000), async (req: 
     const extracted = await extractArticleFromUrl(url);
     res.json(extracted);
   } catch (err) {
-    sendError(res, 422, 'URL_EXTRACTION_FAILED', err instanceof Error ? err.message : 'Unable to extract article from URL.');
+    sendError(res, 422, 'URL_EXTRACTION_FAILED', err instanceof Error ? err.message : 'Could not read that webpage. Please paste the article text directly.');
   }
-});
+}
 
-app.post('/api/v1/extract-file', requireAuth, upload.single('file'), async (req: AuthenticatedRequest, res) => {
+async function handleExtractFile(req: Request, res: Response) {
   const file = req.file;
   if (!file) {
     sendError(res, 400, 'INVALID_FILE', 'No file uploaded.');
@@ -235,7 +276,9 @@ app.post('/api/v1/extract-file', requireAuth, upload.single('file'), async (req:
       text = result.value || '';
     } else if (ext === '.pdf') {
       const pdfParseModule = await import('pdf-parse');
-      const pdfParse = (pdfParseModule as unknown as { default?: (buf: Buffer) => Promise<{ text: string }> }).default || (pdfParseModule as unknown as (buf: Buffer) => Promise<{ text: string }>);
+      const pdfParse =
+        (pdfParseModule as unknown as { default?: (buf: Buffer) => Promise<{ text: string }> }).default ||
+        (pdfParseModule as unknown as (buf: Buffer) => Promise<{ text: string }>);
       const parsed = await pdfParse(file.buffer);
       text = parsed.text || '';
     } else {
@@ -245,113 +288,147 @@ app.post('/api/v1/extract-file', requireAuth, upload.single('file'), async (req:
 
     const cleaned = text.replace(/\s+/g, ' ').trim().slice(0, MAX_TEXT_CHARS);
     if (cleaned.length < 20) {
-      sendError(res, 422, 'EMPTY_DOCUMENT', 'Could not extract readable text from the uploaded file.');
+      sendError(res, 422, 'EMPTY_DOCUMENT', 'Could not read enough text from that file. Please paste the news text directly.');
       return;
     }
 
     res.json({
-      filename: file.originalname,
+      filename: path.basename(file.originalname),
       text: cleaned,
       char_count: cleaned.length,
     });
-  } catch (err) {
-    sendError(res, 422, 'FILE_EXTRACTION_FAILED', err instanceof Error ? err.message : 'Failed to extract text from document.');
+  } catch {
+    sendError(res, 422, 'FILE_EXTRACTION_FAILED', 'Could not read that file. Please try another file or paste the text directly.');
   }
-});
+}
 
-// ==================== ANALYSES ====================
+app.post('/api/v1/extract-url', requireAuth, rateLimit(20, 60_000), handleExtractUrl);
+app.post('/api/v1/extract-file', requireAuth, rateLimit(20, 60_000), upload.single('file'), handleExtractFile);
+app.post('/api/v1/public/extract-url', rateLimit(15, 60_000), handleExtractUrl);
+app.post('/api/v1/public/extract-file', rateLimit(15, 60_000), upload.single('file'), handleExtractFile);
+
+// ==================== SHARED ANALYSIS PIPELINE ====================
 const CreateAnalysisSchema = z.object({
   input_type: z.enum(['text', 'url', 'file', 'headline', 'demo']).default('text'),
   title: z.string().max(300).optional().nullable(),
   url: z.string().max(2048).optional().nullable(),
-  text: z.string().min(10, 'Please enter at least 10 characters for analysis.').max(MAX_TEXT_CHARS),
+  text: z
+    .string()
+    .trim()
+    .min(10, 'Please enter at least 10 characters of news text or a headline.')
+    .max(MAX_TEXT_CHARS, `Input is too long (maximum ${MAX_TEXT_CHARS.toLocaleString()} characters).`)
+    .refine((val) => /[\p{L}\p{N}]/u.test(val), 'Please enter readable text or a headline to check.'),
   is_demo: z.boolean().optional().default(false),
+  output_language: z.enum(['en', 'hi']).optional(),
 });
 
-app.post('/api/v1/analyses', requireAuth, rateLimit(30, 60_000), async (req: AuthenticatedRequest, res) => {
-  const parsed = CreateAnalysisSchema.safeParse(req.body);
-  if (!parsed.success) {
-    sendError(res, 400, 'INVALID_INPUT', parsed.error.issues[0]?.message || 'Invalid analysis input.');
-    return;
+async function runAnalysisPipeline(input: z.infer<typeof CreateAnalysisSchema>) {
+  const startedAt = Date.now();
+  const analysisId = crypto.randomUUID();
+  const { input_type, title, url, text, is_demo } = input;
+
+  // 1. Local ML Pattern Classifier & Linguistic Signals
+  const ml = predictArticle(text);
+  const linguistic = analyzeLinguisticSignals(text, title);
+  const outputLanguage: 'en' | 'hi' = input.output_language || linguistic.detected_language;
+
+  // 2. Optional Live Source Verification (Google CSE / Tavily / Gemini Search Grounding)
+  const evidenceConfigured = isEvidenceProviderConfigured();
+  let evidenceStatus: 'completed' | 'unavailable' | 'error' = evidenceConfigured ? 'completed' : 'unavailable';
+  let evidenceNote = evidenceConfigured
+    ? 'Live source verification ready.'
+    : 'Live web source verification is unavailable. Result is based on AI and pattern analysis only.';
+  let retrievedEvidence: EvidenceRecord[] = [];
+
+  if (evidenceConfigured) {
+    let queries = isGeminiConfigured() ? await extractVerificationQueries(text) : [];
+    if (queries.length === 0) {
+      queries = buildVerificationQueries(text);
+    } else if (queries.length === 1 && !/\bfact[\s-]?check\b/i.test(queries[0])) {
+      queries.push(`${queries[0]} fact check`.slice(0, 120));
+    }
+
+    if (queries.length > 0) {
+      const lookups = await Promise.all(queries.slice(0, 2).map((q) => retrieveEvidenceForQuery(q)));
+      const allItems = lookups.flatMap((l) => l.items);
+      retrievedEvidence = deduplicateEvidence(allItems).slice(0, 5);
+      if (lookups.some((l) => l.status === 'completed') && retrievedEvidence.length > 0) {
+        evidenceStatus = 'completed';
+        evidenceNote = lookups.find((l) => l.items.length > 0)?.note || 'Consulted live web sources.';
+      } else if (lookups.some((l) => l.status === 'error')) {
+        evidenceStatus = 'error';
+        evidenceNote = 'Live web source verification could not be completed right now.';
+      } else {
+        evidenceStatus = 'unavailable';
+        evidenceNote = 'No matching external sources were found for this claim.';
+      }
+    } else {
+      evidenceStatus = 'unavailable';
+      evidenceNote = 'Could not form a search query for external source lookup.';
+    }
   }
 
-  const startedAt = Date.now();
-  const { input_type, title, url, text, is_demo } = parsed.data;
-  const userId = req.user!.id;
-  const analysisId = crypto.randomUUID();
-  const contentHash = crypto.createHash('sha256').update(text.trim()).digest('hex');
+  const evidenceStance = assessEvidenceRecords(text, retrievedEvidence);
+  const stanceWeight = (rel: EvidenceRecord['relation']) =>
+    rel === 'contradicts' ? 2 : rel === 'supports' ? 1 : 0;
+  retrievedEvidence = [...evidenceStance.items].sort(
+    (a, b) => stanceWeight(b.relation) - stanceWeight(a.relation)
+  );
 
-  // 1. Genuine ML prediction
-  const ml = predictArticle(text);
-
-  // 2. Linguistic & transparency signals
-  const linguistic = analyzeLinguisticSignals(text, title);
-
-  // 3. Gemini contextual analysis & claim extraction (graceful degradation if unconfigured)
+  // 3. Gemini Contextual & Evidence-Grounded Analysis
   const mlSummaryStr = ml.available
-    ? `${ml.predicted_class} (uncalibrated score: ${ml.score}, confidence: ${ml.confidence_label})`
-    : 'ML model unavailable';
-  const geminiResult = await runGeminiArticleAnalysis(text, mlSummaryStr);
+    ? `writing-style pattern aligns with ${ml.predicted_class === 'misleading_or_sensational' ? 'sensational/misleading' : 'standard reporting'} style`
+    : 'local English style check not applicable';
+  const lingFlagsStr = [
+    linguistic.sensationalism_indicators.length > 0 ? 'dramatic/urgent phrasing detected' : '',
+    linguistic.attribution_quality.length > 0 ? 'unnamed/vague attribution detected' : '',
+    linguistic.certainty_language.length > 0 ? 'absolute certainty phrasing detected' : '',
+    linguistic.is_short_input ? 'short or headline-only input' : '',
+  ]
+    .filter(Boolean)
+    .join(', ') || 'neutral phrasing';
+
+  const geminiResult = await runGeminiArticleAnalysis(text, {
+    mlSummary: mlSummaryStr,
+    linguisticFlagsSummary: lingFlagsStr,
+    retrievedEvidence,
+    evidenceStatus,
+    outputLanguage,
+  });
+
+  // 4. Cautious Verdict Aggregation
+  const hasRealEvidence = evidenceStatus === 'completed' && retrievedEvidence.length > 0;
+  const assessment = computeCautiousAssessment(
+    ml,
+    linguistic,
+    hasRealEvidence,
+    geminiResult.data,
+    outputLanguage,
+    evidenceStance
+  );
 
   const rawClaims =
     geminiResult.status === 'completed' && geminiResult.data && geminiResult.data.claims.length > 0
       ? geminiResult.data.claims
       : extractFallbackClaims(text);
 
-  // 4. Optional Evidence Search
-  const evidenceConfigured = isEvidenceProviderConfigured();
-  const evidenceByClaimIdx: Record<number, EvidenceRecord[]> = {};
-  let evidenceStatus: 'completed' | 'unavailable' | 'error' = evidenceConfigured ? 'completed' : 'unavailable';
-
-  if (evidenceConfigured) {
-    for (let i = 0; i < Math.min(rawClaims.length, 3); i++) {
-      const claim = rawClaims[i];
-      if (claim.checkability === 'checkable' && claim.search_query) {
-        const lookup = await retrieveEvidenceForQuery(claim.search_query);
-        if (lookup.status === 'error') evidenceStatus = 'error';
-        evidenceByClaimIdx[i] = lookup.items;
-      }
-    }
-  }
-
-  // 5. Cautious Assessment Aggregation
-  const assessment = computeCautiousAssessment(ml, linguistic, evidenceStatus === 'completed');
-
-  const summary =
-    geminiResult.data?.summary ||
-    (linguistic.is_short_input
-      ? 'Short or headline-only input analyzed using the trained NLP classifier and linguistic signal detector. Provide the full article body for deeper claim extraction.'
-      : `Analyzed ${linguistic.word_count} words using the trained TF-IDF Logistic Regression classifier (${ml.predicted_class || 'unavailable'}) and rule-based linguistic indicators. ${geminiResult.status === 'unavailable' ? 'Gemini contextual analysis is currently unconfigured.' : ''}`);
-
-  const topic = geminiResult.data?.topic || 'General News';
-  const framingNotes =
-    geminiResult.data?.framing_observations && geminiResult.data.framing_observations.length > 0
-      ? [...geminiResult.data.framing_observations, ...linguistic.framing_notes]
-      : linguistic.framing_notes;
-
-  const nextSteps =
-    geminiResult.data?.next_steps && geminiResult.data.next_steps.length > 0
-      ? geminiResult.data.next_steps
-      : [
-          'Check whether primary institutional records or official datasets corroborate the core claims.',
-          'Search for independent reporting from at least two established newsrooms.',
-          'Verify the original publication date, author credentials, and full context of any quoted statistics.',
-        ];
-
-  const createdAt = new Date().toISOString();
-  const processingMs = Date.now() - startedAt;
-
   const structuredClaims = rawClaims.map((c, idx) => {
     const claimId = crypto.randomUUID();
-    const ev = evidenceByClaimIdx[idx] || [];
+    const ev = idx === 0 ? retrievedEvidence.slice(0, 3) : [];
+    const fallbackStatus =
+      idx === 0 && evidenceStance.contradictingCount > 0
+        ? 'contradicted'
+        : idx === 0 && evidenceStance.supportingCount > 0
+          ? 'supported'
+          : c.claim_status;
     const status =
       c.checkability !== 'checkable'
         ? 'not_checkable'
-        : !evidenceConfigured
+        : !hasRealEvidence
           ? 'retrieval_unavailable'
-          : ev.length > 0
-            ? 'unverified'
-            : 'unverified';
+          : geminiResult.status === 'completed'
+            ? c.claim_status
+            : fallbackStatus;
     return {
       id: claimId,
       text: c.text,
@@ -364,109 +441,179 @@ app.post('/api/v1/analyses', requireAuth, rateLimit(30, 60_000), async (req: Aut
     };
   });
 
-  const reportPayload = {
-    analysis_id: analysisId,
-    status: geminiResult.status === 'error' ? 'partial' : 'completed',
-    is_demo: Boolean(is_demo || input_type === 'demo'),
-    input: {
-      type: input_type,
-      title: title || text.slice(0, 80).trim() + (text.length > 80 ? '...' : ''),
-      url: url || null,
-      language: 'en',
-      word_count: linguistic.word_count,
-      is_short_input: linguistic.is_short_input,
-    },
-    topic,
-    assessment,
+  const summary = geminiResult.data?.summary || assessment.simple_why;
+  const topic = geminiResult.data?.topic || 'General News';
+  const framingNotes =
+    geminiResult.data?.framing_observations && geminiResult.data.framing_observations.length > 0
+      ? geminiResult.data.framing_observations
+      : linguistic.framing_notes;
+
+  const nextSteps =
+    geminiResult.data?.next_steps && geminiResult.data.next_steps.length > 0
+      ? geminiResult.data.next_steps
+      : [
+          'Check official government or institutional websites if the message mentions an official announcement.',
+          'Search for the main claim on at least two well-known, trusted news outlets.',
+          'Avoid forwarding alarming claims until you confirm when and where the event actually happened.',
+        ];
+
+  const createdAt = new Date().toISOString();
+  const processingMs = Date.now() - startedAt;
+
+  return {
+    analysisId,
+    createdAt,
+    processingMs,
     ml,
+    linguistic,
+    geminiResult,
+    evidenceStatus,
+    evidenceNote,
+    retrievedEvidence,
+    assessment,
     summary,
-    claims: structuredClaims,
-    linguistic_analysis: {
-      sensationalism_indicators: linguistic.sensationalism_indicators,
-      loaded_language: linguistic.loaded_language,
-      certainty_language: linguistic.certainty_language,
-      attribution_quality: linguistic.attribution_quality,
-      framing_notes: framingNotes,
-    },
-    transparency_checks: linguistic.transparency_checks,
-    next_steps: nextSteps,
-    providers: {
-      gemini: geminiResult.status,
-      gemini_error: geminiResult.error || null,
-      evidence_search: evidenceStatus,
-    },
-    provenance: {
-      created_at: createdAt,
-      processing_ms: processingMs,
-      model_version: ml.version || 'unavailable',
-      analysis_pipeline_version: '1.0.0',
+    structuredClaims,
+    reportPayload: {
+      analysis_id: analysisId,
+      status: geminiResult.status === 'error' ? 'partial' : 'completed',
+      is_demo: Boolean(is_demo || input_type === 'demo'),
+      input: {
+        type: input_type,
+        title: title || text.slice(0, 80).trim() + (text.length > 80 ? '...' : ''),
+        url: url || null,
+        language: outputLanguage,
+        detected_language: linguistic.detected_language,
+        word_count: linguistic.word_count,
+        is_short_input: linguistic.is_short_input,
+      },
+      topic,
+      assessment,
+      ml,
+      summary,
+      sources_consulted: retrievedEvidence,
+      evidence_note: evidenceNote,
+      claims: structuredClaims,
+      linguistic_analysis: {
+        sensationalism_indicators: linguistic.sensationalism_indicators,
+        loaded_language: linguistic.loaded_language,
+        certainty_language: linguistic.certainty_language,
+        attribution_quality: linguistic.attribution_quality,
+        framing_notes: framingNotes,
+      },
+      transparency_checks: linguistic.transparency_checks,
+      next_steps: nextSteps,
+      providers: {
+        gemini: geminiResult.status,
+        gemini_error: geminiResult.error || null,
+        evidence_search: evidenceStatus,
+      },
+      provenance: {
+        created_at: createdAt,
+        processing_ms: processingMs,
+        model_version: ml.version || 'unavailable',
+        analysis_pipeline_version: '1.1.0',
+      },
     },
   };
+}
 
-  // Persist to SQLite in a single transaction
-  const insertTx = db.transaction(() => {
-    db.prepare(
-      `INSERT INTO analyses (
-        id, user_id, input_type, original_url, title, input_text, content_hash, language, status,
-        assessment_label, model_score, model_confidence_label, model_version, gemini_status,
-        evidence_status, summary, report_json, processing_ms, created_at, completed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'en', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      analysisId,
-      userId,
-      input_type,
-      url || null,
-      reportPayload.input.title,
-      text,
-      contentHash,
-      reportPayload.status,
-      assessment.label,
-      ml.score,
-      ml.confidence_label,
-      ml.version,
-      geminiResult.status,
-      evidenceStatus,
-      summary,
-      JSON.stringify(reportPayload),
-      processingMs,
-      createdAt,
-      createdAt
-    );
+// Public Check News endpoint (no sign-in required; rate-limited; does not persist private history)
+app.post('/api/v1/public/analyze', rateLimit(20, 60_000), async (req, res) => {
+  const parsed = CreateAnalysisSchema.safeParse(req.body);
+  if (!parsed.success) {
+    sendError(res, 400, 'INVALID_INPUT', parsed.error.issues[0]?.message || 'Please enter valid news text or a headline.');
+    return;
+  }
 
-    const insertClaim = db.prepare(
-      `INSERT INTO claims (id, analysis_id, claim_text, claim_type, checkability, status, explanation, search_query, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    );
-    const insertEv = db.prepare(
-      `INSERT INTO evidence_items (id, claim_id, analysis_id, source_url, source_title, publisher, published_at, retrieved_at, snippet, relation, provider, relevance_score, dedupe_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    );
+  try {
+    const result = await runAnalysisPipeline(parsed.data);
+    res.status(200).json(result.reportPayload);
+  } catch {
+    sendError(res, 500, 'ANALYSIS_FAILED', 'Sorry, we could not check this news right now. Please try again.');
+  }
+});
 
-    for (const c of structuredClaims) {
-      insertClaim.run(c.id, analysisId, c.text, c.type, c.checkability, c.status, c.explanation, c.search_query, createdAt);
-      for (const e of c.evidence) {
-        insertEv.run(
-          crypto.randomUUID(),
-          c.id,
-          analysisId,
-          e.source_url,
-          e.source_title,
-          e.publisher,
-          e.published_at,
-          e.retrieved_at,
-          e.snippet,
-          e.relation,
-          e.provider,
-          e.relevance_score,
-          e.dedupe_hash
-        );
+// ==================== ANALYSES (AUTHENTICATED & PERSISTED) ====================
+app.post('/api/v1/analyses', requireAuth, rateLimit(30, 60_000), async (req: AuthenticatedRequest, res) => {
+  const parsed = CreateAnalysisSchema.safeParse(req.body);
+  if (!parsed.success) {
+    sendError(res, 400, 'INVALID_INPUT', parsed.error.issues[0]?.message || 'Please enter valid news text or a headline.');
+    return;
+  }
+
+  try {
+    const userId = req.user!.id;
+    const contentHash = crypto.createHash('sha256').update(parsed.data.text.trim()).digest('hex');
+    const result = await runAnalysisPipeline(parsed.data);
+    const { analysisId, createdAt, processingMs, ml, geminiResult, evidenceStatus, assessment, summary, structuredClaims, reportPayload } =
+      result;
+
+    const insertTx = db.transaction(() => {
+      db.prepare(
+        `INSERT INTO analyses (
+          id, user_id, input_type, original_url, title, input_text, content_hash, language, status,
+          assessment_label, model_score, model_confidence_label, model_version, gemini_status,
+          evidence_status, summary, report_json, processing_ms, created_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        analysisId,
+        userId,
+        parsed.data.input_type,
+        parsed.data.url || null,
+        reportPayload.input.title,
+        parsed.data.text,
+        contentHash,
+        reportPayload.input.language,
+        reportPayload.status,
+        assessment.label,
+        ml.score,
+        ml.confidence_label,
+        ml.version,
+        geminiResult.status,
+        evidenceStatus,
+        summary,
+        JSON.stringify(reportPayload),
+        processingMs,
+        createdAt,
+        createdAt
+      );
+
+      const insertClaim = db.prepare(
+        `INSERT INTO claims (id, analysis_id, claim_text, claim_type, checkability, status, explanation, search_query, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      const insertEv = db.prepare(
+        `INSERT INTO evidence_items (id, claim_id, analysis_id, source_url, source_title, publisher, published_at, retrieved_at, snippet, relation, provider, relevance_score, dedupe_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+
+      for (const c of structuredClaims) {
+        insertClaim.run(c.id, analysisId, c.text, c.type, c.checkability, c.status, c.explanation, c.search_query, createdAt);
+        for (const e of c.evidence) {
+          insertEv.run(
+            crypto.randomUUID(),
+            c.id,
+            analysisId,
+            e.source_url,
+            e.source_title,
+            e.publisher,
+            e.published_at,
+            e.retrieved_at,
+            e.snippet,
+            e.relation,
+            e.provider,
+            e.relevance_score,
+            e.dedupe_hash
+          );
+        }
       }
-    }
-  });
+    });
 
-  insertTx();
-
-  res.status(201).json(reportPayload);
+    insertTx();
+    res.status(201).json(reportPayload);
+  } catch {
+    sendError(res, 500, 'ANALYSIS_FAILED', 'Sorry, we could not check this news right now. Please try again.');
+  }
 });
 
 app.get('/api/v1/analyses', requireAuth, (req: AuthenticatedRequest, res) => {
@@ -552,7 +699,12 @@ app.delete('/api/v1/analyses/:id/save', requireAuth, (req: AuthenticatedRequest,
 });
 
 app.post('/api/v1/analyses/:id/feedback', requireAuth, (req: AuthenticatedRequest, res) => {
-  const category = typeof req.body?.category === 'string' ? req.body.category : 'general';
+  const exists = db.prepare('SELECT id FROM analyses WHERE id = ? AND user_id = ?').get(req.params.id, req.user!.id);
+  if (!exists) {
+    sendError(res, 404, 'NOT_FOUND', 'Analysis report not found.');
+    return;
+  }
+  const category = typeof req.body?.category === 'string' ? req.body.category.slice(0, 64) : 'general';
   const feedbackText = typeof req.body?.feedback_text === 'string' ? req.body.feedback_text.slice(0, 1000) : '';
   db.prepare(
     `INSERT INTO feedback (id, user_id, analysis_id, category, feedback_text, created_at) VALUES (?, ?, ?, ?, ?, ?)`
@@ -560,7 +712,7 @@ app.post('/api/v1/analyses/:id/feedback', requireAuth, (req: AuthenticatedReques
   res.status(201).json({ ok: true });
 });
 
-app.post('/api/v1/analyses/:id/chat/stream', requireAuth, async (req: AuthenticatedRequest, res) => {
+app.post('/api/v1/analyses/:id/chat/stream', requireAuth, rateLimit(20, 60_000), async (req: AuthenticatedRequest, res) => {
   const row = db
     .prepare('SELECT report_json FROM analyses WHERE id = ? AND user_id = ?')
     .get(req.params.id, req.user!.id) as { report_json: string } | undefined;
@@ -570,8 +722,20 @@ app.post('/api/v1/analyses/:id/chat/stream', requireAuth, async (req: Authentica
     return;
   }
 
-  const question = typeof req.body?.question === 'string' ? req.body.question.trim() : '';
-  const history = Array.isArray(req.body?.history) ? req.body.history : [];
+  const question = typeof req.body?.question === 'string' ? req.body.question.trim().slice(0, 1000) : '';
+  const history = Array.isArray(req.body?.history)
+    ? req.body.history
+        .filter((m: unknown): m is { role: 'user' | 'assistant'; text: string } => {
+          return (
+            typeof m === 'object' &&
+            m !== null &&
+            ((m as { role?: unknown }).role === 'user' || (m as { role?: unknown }).role === 'assistant') &&
+            typeof (m as { text?: unknown }).text === 'string'
+          );
+        })
+        .map((m: { role: 'user' | 'assistant'; text: string }) => ({ role: m.role, text: m.text.slice(0, 1000) }))
+    : [];
+
   if (!question) {
     sendError(res, 400, 'INVALID_INPUT', 'Please enter a follow-up question.');
     return;
@@ -586,8 +750,8 @@ app.post('/api/v1/analyses/:id/chat/stream', requireAuth, async (req: Authentica
       res.write(`data: ${JSON.stringify({ text: chunk })}\n\n`);
     }
     res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-  } catch (err) {
-    res.write(`data: ${JSON.stringify({ error: err instanceof Error ? err.message : 'Streaming failed' })}\n\n`);
+  } catch {
+    res.write(`data: ${JSON.stringify({ error: 'Sorry, the assistant could not reply right now.' })}\n\n`);
   } finally {
     res.end();
   }
@@ -650,7 +814,7 @@ app.post('/api/v1/compare', requireAuth, (req: AuthenticatedRequest, res) => {
   const reports = rows.map((r) => JSON.parse(r.report_json));
   res.json({
     items: reports,
-    note: 'Comparison highlights differences in ML lexical signals, claims, and framing. Disagreement between articles does not alone prove one article false.',
+    note: 'Side-by-side comparison highlights differences in claims, tone, and sources consulted.',
   });
 });
 
@@ -688,6 +852,15 @@ app.get('/api/v1/settings/export', requireAuth, (req: AuthenticatedRequest, res)
 app.delete('/api/v1/settings/history', requireAuth, (req: AuthenticatedRequest, res) => {
   db.prepare('DELETE FROM analyses WHERE user_id = ?').run(req.user!.id);
   res.json({ ok: true, message: 'All analysis history deleted.' });
+});
+
+// Friendly API error middleware (Multer & unexpected exceptions)
+app.use('/api', (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  if (err && typeof err === 'object' && 'code' in err && (err as { code?: string }).code === 'LIMIT_FILE_SIZE') {
+    sendError(res, 413, 'FILE_TOO_LARGE', 'The uploaded file is too large (maximum 10 MB).');
+    return;
+  }
+  sendError(res, 500, 'SERVER_ERROR', 'Sorry, we could not check this news right now. Please try again.');
 });
 
 // ==================== START SERVER ====================

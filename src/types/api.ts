@@ -5,6 +5,8 @@ export type AssessmentLabel =
   | 'NEEDS_VERIFICATION'
   | 'ANALYSIS_UNAVAILABLE';
 
+export type SimpleVerdict = 'likely_true' | 'likely_fake' | 'unverified';
+
 export interface User {
   id: string;
   email: string;
@@ -57,7 +59,8 @@ export interface AnalysisReport {
     type: string;
     title: string | null;
     url: string | null;
-    language: string;
+    language: 'en' | 'hi' | string;
+    detected_language?: 'en' | 'hi';
     word_count: number;
     is_short_input: boolean;
   };
@@ -65,6 +68,10 @@ export interface AnalysisReport {
   assessment: {
     label: AssessmentLabel;
     display_label: string;
+    simple_verdict?: SimpleVerdict;
+    simple_result_title?: string;
+    simple_why?: string;
+    simple_advice?: string;
     reason: string;
     limitations: string[];
   };
@@ -80,6 +87,8 @@ export interface AnalysisReport {
     limitations_note: string;
   };
   summary: string;
+  sources_consulted?: EvidenceItem[];
+  evidence_note?: string;
   claims: ClaimItem[];
   linguistic_analysis: {
     sensationalism_indicators: LinguisticIndicator[];

@@ -1,12 +1,23 @@
-const TOKEN_KEY = 'truthlens_auth_token';
+// Keep auth token strictly in JS memory (never in localStorage/sessionStorage);
+// persistent sessions rely on the server-issued HttpOnly cookie.
+let memoryToken: string | null = null;
 
 export function getStoredToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY);
+  return memoryToken;
 }
 
 export function setStoredToken(token: string | null): void {
-  if (token) localStorage.setItem(TOKEN_KEY, token);
-  else localStorage.removeItem(TOKEN_KEY);
+  memoryToken = token;
+}
+
+export function isSafeHttpUrl(rawUrl: string | null | undefined): boolean {
+  if (!rawUrl || typeof rawUrl !== 'string') return false;
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
 }
 
 export class ApiError extends Error {
@@ -19,9 +30,10 @@ export class ApiError extends Error {
   }
 }
 
-export async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
+export async function apiFetch<T>(path: string, options: RequestInit = {}, timeoutMs = 30000): Promise<T> {
   const token = getStoredToken();
   const headers: Record<string, string> = {
+    'X-Requested-With': 'TruthLens',
     ...(options.headers as Record<string, string> | undefined),
   };
 
@@ -32,15 +44,33 @@ export async function apiFetch<T>(path: string, options: RequestInit = {}): Prom
     headers['Authorization'] = `Bearer ${token}`;
   }
 
-  const res = await fetch(path, { ...options, headers });
-  const data = await res.json().catch(() => ({}));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  if (!res.ok) {
-    const errMsg = data?.error?.message || `Request failed with status ${res.status}`;
-    const errCode = data?.error?.code || 'REQUEST_FAILED';
-    throw new ApiError(errMsg, errCode, res.status);
+  try {
+    const res = await fetch(path, {
+      ...options,
+      headers,
+      credentials: 'include',
+      signal: options.signal || controller.signal,
+    });
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      const errMsg = data?.error?.message || 'Sorry, we could not complete that request right now. Please try again.';
+      const errCode = data?.error?.code || 'REQUEST_FAILED';
+      throw new ApiError(errMsg, errCode, res.status);
+    }
+    return data as T;
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new ApiError('The request took too long. Please try again.', 'TIMEOUT', 408);
+    }
+    throw new ApiError('Sorry, we could not reach the server right now. Please try again.', 'NETWORK_ERROR', 0);
+  } finally {
+    clearTimeout(timer);
   }
-  return data as T;
 }
 
 export async function streamChatFollowup(
@@ -53,8 +83,10 @@ export async function streamChatFollowup(
   const token = getStoredToken();
   const res = await fetch(`/api/v1/analyses/${analysisId}/chat/stream`, {
     method: 'POST',
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
+      'X-Requested-With': 'TruthLens',
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: JSON.stringify({ question, history }),
@@ -62,7 +94,7 @@ export async function streamChatFollowup(
   });
 
   if (!res.ok || !res.body) {
-    throw new Error('Failed to start assistant stream.');
+    throw new Error('Sorry, the assistant could not respond right now.');
   }
 
   const reader = res.body.getReader();
