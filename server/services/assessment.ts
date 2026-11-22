@@ -186,23 +186,22 @@ export function computeCautiousAssessment(
       verdict = 'likely_fake';
       label = 'POTENTIALLY_MISLEADING';
       displayLabel = outputLanguage === 'hi' ? 'संभवतः झूठी / भ्रामक' : 'Likely Fake / Misleading';
-    } else if (highRiskLinguisticCount >= 2 || (mlSuggestsFake && highRiskLinguisticCount >= 1) || mlSuggestsFake) {
-      verdict = 'likely_fake';
-      label = 'POTENTIALLY_MISLEADING';
-      displayLabel = outputLanguage === 'hi' ? 'संभवतः झूठी / भ्रामक' : 'Likely Fake / Misleading';
     } else if (evidenceStronglySupported && highRiskLinguisticCount === 0 && linguistic.loaded_language.length === 0) {
       verdict = 'likely_true';
       label = 'LIKELY_CREDIBLE';
       displayLabel = outputLanguage === 'hi' ? 'संभवतः सही' : 'Likely True';
-    } else if (!ml.available && linguistic.word_count < 10 && highRiskLinguisticCount === 0) {
+    } else if (linguistic.word_count < 6 && highRiskLinguisticCount === 0) {
       verdict = 'unverified';
       label = 'INSUFFICIENT_EVIDENCE';
       displayLabel = outputLanguage === 'hi' ? 'अपुष्ट (पुष्टि नहीं हो सकी)' : 'Unverified';
-    } else if (linguistic.is_short_input) {
-      verdict = 'unverified';
-      label = 'INSUFFICIENT_EVIDENCE';
-      displayLabel = outputLanguage === 'hi' ? 'अपुष्ट (पुष्टि नहीं हो सकी)' : 'Unverified';
-    } else if ((mlSuggestsCredible && highRiskLinguisticCount === 0 && evidenceAvailable && (evidenceStance?.supportingCount ?? 0) >= 1 && (evidenceStance?.contradictingCount ?? 0) === 0) || strongMlCredible) {
+    } else if (
+      highRiskLinguisticCount >= 1 ||
+      (ml.available && ml.predicted_class === 'misleading_or_sensational' && (ml.score ?? 0) >= 0.45)
+    ) {
+      verdict = 'likely_fake';
+      label = 'POTENTIALLY_MISLEADING';
+      displayLabel = outputLanguage === 'hi' ? 'संभवतः झूठी / भ्रामक' : 'Likely Fake / Misleading';
+    } else if (highRiskLinguisticCount === 0 && linguistic.loaded_language.length === 0 && linguistic.word_count >= 6) {
       verdict = 'likely_true';
       label = 'LIKELY_CREDIBLE';
       displayLabel = outputLanguage === 'hi' ? 'संभवतः सही' : 'Likely True';

@@ -212,8 +212,15 @@ export function assessEvidenceRecords(articleText: string, items: EvidenceRecord
     return { ...item, relation: 'context' as const };
   });
 
+  const relevantItems = updated.filter((item) => {
+    const haystack = `${item.source_title} ${item.snippet}`.toLowerCase();
+    const overlapCount = topicTokens.filter((tok) => haystack.includes(tok)).length;
+    const isFactChecker = FACT_CHECKER_HOST_RE.test(item.publisher);
+    return overlapCount >= (topicTokens.length <= 2 ? 1 : 2) || isFactChecker;
+  });
+
   return {
-    items: updated,
+    items: relevantItems,
     contradictingCount,
     supportingCount,
     authoritativeDebunk,

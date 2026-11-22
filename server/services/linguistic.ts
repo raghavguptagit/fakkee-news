@@ -83,7 +83,7 @@ export function analyzeLinguisticSignals(text: string, title?: string | null): L
   const detectedLanguage = detectInputLanguage(text);
   const words = text.trim().split(/\s+/).filter(Boolean);
   const wordCount = words.length;
-  const isShortInput = wordCount < 25;
+  const isShortInput = wordCount < 8;
 
   const sensationalism = collectMatches(text, SENSATIONAL_PATTERNS);
   const loaded = collectMatches(text, LOADED_PATTERNS);
